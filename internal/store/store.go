@@ -2259,27 +2259,44 @@ func (s *Store) ensurePromptsFTSTrigram() error {
 }
 
 func (s *Store) recreateObservationFTSTriggers() error {
-	// Keep trigger shape aligned with main's delete/insert FTS sync. Soft-delete
-	// gating (WHERE new.deleted_at IS NULL) belongs in a separate PR.
+	// Soft-deleted observations must not live in the FTS index: Search already
+	// filters deleted_at IS NULL, and for an external-content FTS5 table issuing
+	// a 'delete' command for a row that was never indexed corrupts the index.
+	// Gate every operation on deleted_at so the index holds exactly the live rows
+	// and a 'delete' only fires for a row that was actually indexed.
 	if _, err := s.execHook(s.db, `
 		DROP TRIGGER IF EXISTS obs_fts_insert;
 		DROP TRIGGER IF EXISTS obs_fts_update;
 		DROP TRIGGER IF EXISTS obs_fts_delete;
-		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
+		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations
+		WHEN new.deleted_at IS NULL
+		BEGIN
 			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
 			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
 		END;
 
-		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
+		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations
+		WHEN old.deleted_at IS NULL
+		BEGIN
 			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
 			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
 		END;
 
-		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
+		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations
+		WHEN old.title IS NOT new.title
+			OR old.content IS NOT new.content
+			OR old.tool_name IS NOT new.tool_name
+			OR old.type IS NOT new.type
+			OR old.project IS NOT new.project
+			OR old.topic_key IS NOT new.topic_key
+			OR old.deleted_at IS NOT new.deleted_at
+		BEGIN
 			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			SELECT 'delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key
+			WHERE old.deleted_at IS NULL;
 			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+			SELECT new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key
+			WHERE new.deleted_at IS NULL;
 		END;
 	`); err != nil {
 		return fmt.Errorf("recreate observations fts triggers: %w", err)

@@ -1668,6 +1668,89 @@ func TestTrigramFTSTriggersSupportUpdateAndDelete(t *testing.T) {
 	}
 }
 
+// ftsMatchCount returns how many rows the observations_fts index itself matches
+// for term, independent of the observations.deleted_at filter that Search adds.
+// This lets a test assert what is actually indexed, not just what Search returns.
+func ftsMatchCount(t *testing.T, s *Store, term string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM observations_fts WHERE observations_fts MATCH ?`, term,
+	).Scan(&n); err != nil {
+		t.Fatalf("count observations_fts match %q (index may be corrupt): %v", term, err)
+	}
+	return n
+}
+
+// TestFTSTriggersGateSoftDeletedObservations verifies the deleted_at gating: a
+// soft-deleted observation must be removed from the external-content FTS index
+// (not merely filtered out by Search), and a subsequent hard DELETE of that
+// already-unindexed row must not issue a second 'delete' — which for an
+// external-content FTS5 table corrupts the index ("database disk image is
+// malformed"). It also confirms the index stays queryable and correct.
+func TestFTSTriggersGateSoftDeletedObservations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-gate", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// A second, always-live row proves the index stays queryable and correct
+	// after the delete sequence on the target row.
+	// Use a >=3-rune term so a raw trigram FTS MATCH can find it (trigram
+	// tokenization only indexes terms of at least three characters).
+	liveID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-gate", Type: "bugfix",
+		Title: "生存記録", Content: "生存記録サンドボックス検索",
+		Project: "engram", Scope: "project",
+	})
+	if err != nil {
+		t.Fatalf("add live observation: %v", err)
+	}
+
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-gate", Type: "bugfix",
+		Title: "削除対象", Content: "削除対象サンドボックス検索",
+		Project: "engram", Scope: "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if got := ftsMatchCount(t, s, "削除対象"); got != 1 {
+		t.Fatalf("expected live row indexed, got fts match count %d", got)
+	}
+
+	// Soft delete must remove the row from the FTS index (gated update trigger).
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if got := ftsMatchCount(t, s, "削除対象"); got != 0 {
+		t.Fatalf("expected soft-deleted row removed from fts index, got match count %d", got)
+	}
+
+	// Hard DELETE the same, now-unindexed row via the raw path that internal
+	// purges use (project deletion, sync import). The gated delete trigger must
+	// skip the FTS 'delete' so the index is not corrupted.
+	if _, err := s.db.Exec(`DELETE FROM observations WHERE id = ?`, obsID); err != nil {
+		t.Fatalf("hard delete soft-deleted row: %v", err)
+	}
+	if got := ftsMatchCount(t, s, "削除対象"); got != 0 {
+		t.Fatalf("expected no fts match after hard delete, got %d", got)
+	}
+
+	// The index remains queryable and the untouched live row is still found.
+	if got := ftsMatchCount(t, s, "生存記録"); got != 1 {
+		t.Fatalf("expected live row still indexed after delete sequence, got %d", got)
+	}
+	results, err := s.Search("生存記録", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("search live row after delete sequence: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != liveID {
+		t.Fatalf("expected live row still searchable, got %+v", results)
+	}
+}
+
 func TestMigrateRebuildsLegacyFTSTablesWithTrigram(t *testing.T) {
 	s := newTestStore(t)
 

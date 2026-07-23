@@ -45,6 +45,7 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 - **fix(store):** use SQLite FTS5 trigram indexes for observations and prompts so Japanese, Chinese, and Korean substring searches work through CLI, MCP, HTTP, and TUI search.
 - **fix(store):** preserve short-token searches such as `v2` with a bounded `LIKE` fallback when every query term is under three characters (trigram indexes only match terms with at least three characters).
+- **fix(store):** gate the observation FTS triggers on `deleted_at` so soft-deleted rows leave the trigram index and a hard delete never issues a second external-content `'delete'`, preventing index corruption (`database disk image is malformed`).
 
 ### Cloud user token management (`cloud-user-token-management`)
 
